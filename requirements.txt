@@ -1,1 +1,5 @@
-streamlit>=1.40 google-genai>=1.30 pypdf>=5.0 python-docx>=1.1 pydantic>=2.0
+streamlit
+google-genai
+pypdf
+python-docx
+pydantic
