@@ -6,6 +6,7 @@ and get an ATS score with concrete improvements.
 
 import io
 import os
+import time
 
 import streamlit as st
 from docx import Document
@@ -18,6 +19,8 @@ from pypdf import PdfReader
 # Config
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.5-flash"  # change in Streamlit secrets with MODEL_NAME
+FALLBACK_MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"]  # tried if the main model is busy
+RETRIES_PER_MODEL = 3
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
 MAX_JD_CHARS = 8_000
@@ -136,16 +139,34 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
     else:
         prompt += "\nNo job description provided. Evaluate for general ATS-readiness.\n"
 
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=ATSReport,
-            temperature=0.2,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=ATSReport,
+        temperature=0.2,
     )
+
+    response = None
+    last_error = None
+    for m in [model] + [f for f in FALLBACK_MODELS if f != model]:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=m, contents=prompt, config=config)
+                break
+            except Exception as e:
+                last_error = e
+                msg = str(e)
+                if any(k in msg for k in ("API key", "API_KEY", "401", "403")):
+                    raise  # bad key: no point trying other models
+                busy = any(k in msg for k in ("503", "UNAVAILABLE", "overloaded", "high demand", "500", "INTERNAL"))
+                if busy and attempt < RETRIES_PER_MODEL - 1:
+                    time.sleep(2 * (attempt + 1))  # 2s, 4s
+                    continue
+                break  # not retryable (or out of retries): try the next model
+        if response is not None:
+            break
+    if response is None:
+        raise last_error
 
     text = (response.text or "").strip()
     if not text:
@@ -269,7 +290,10 @@ def main() -> None:
         placeholder="Paste the job posting here...",
     )
 
-    if st.button("Analyze resume", type="primary", disabled=uploaded is None):
+    if st.button("Analyze resume", type="primary"):
+        if uploaded is None:
+            st.warning("Please upload your resume first.")
+            return
         if not api_key:
             st.error("Please add your Gemini API key in the sidebar.")
             return
@@ -304,6 +328,8 @@ def main() -> None:
                 st.error("Gemini rejected the API key. Please check that it's correct.")
             elif "429" in msg or "quota" in msg.lower():
                 st.error("Rate limit or quota reached. Wait a minute and try again.")
+            elif "503" in msg or "UNAVAILABLE" in msg:
+                st.error("Gemini is very busy right now. Please wait a minute and click Analyze again.")
             elif "404" in msg or "not found" in msg.lower():
                 st.error(f"Model `{model}` was not found. Set MODEL_NAME in secrets to a valid Gemini Flash model.")
             else:
